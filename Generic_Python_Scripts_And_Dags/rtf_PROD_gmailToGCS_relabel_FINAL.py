@@ -70,19 +70,78 @@ def get_attachments(service, user_id, msg_id, message=None):
     
     return atts
 
+def test_video(df: pd.DataFrame):
+
+    errors = []
+    video_columns = {'Site': 'site', 'Data Source': 'dataSource', 'Date': 'date', 'Package Name': 'placementGroupName',
+                    'Placement Name or DCM ID': 'placementName', 'Creative': 'creativeName', 'Skip/Non-Skip': 'skip',
+                    'Video Type': 'videoType', 'Impressions (if applicable)': 'impressions', 'Video Starts': 'videoPlays',
+                    '25% Completion': 'videoFirstQuartileCompletions', '50% Completion': 'videoMidpoints',
+                    '75% Completion': 'videoThirdQuartileCompletions', 'Video Completes': 'videoCompletions',
+                    'Completion Rate': 'videoCompletionRate'}
+    missing_cols = [lambda x: x for x in video_columns if x not in df.columns] # Columns that are missing from the file
+    if len(missing_cols) > 0:
+        errors.append("File is missing these columns: " + ", ".join(missing_cols))
+
+    df.drop(df.loc[df.Site == 'Ex'].index, inplace=True) # Get rid of example row
+
+    if df.Site.count() not in [1, df.shape[0]]: # Check site column
+        errors.append("Unable to determine Site for some rows. If using merged cells, try un-merging them.")
+    elif df.Site.count() == 1:
+        df['Site'] = df.loc[~df['Site'].isna()]['Site'].values[0]
+        
+    try:
+        pd.to_datetime(df.Date) # Check date column
+    except ValueError:
+        errors.append("At least one invalid date in Date column.")
+
+    number_cols = list(filter(
+        lambda x: x not in missing_cols,
+        ['Impressions (if applicable)', 'Video Starts', '25% Completion',
+        '50% Completion', '75% Completion', 'Video Completes', 'Completion Rate']))
+    error_num_cols = []
+    for col in number_cols: # Check number columns
+        try:
+            pd.to_numeric(df[col])
+        except ValueError:
+            error_num_cols.append(col)
+    if error_num_cols > 0:
+        msg = "Non-numeric data in the following columns: " + ", ".join(error_num_cols)
+        errors.append(msg)
+
+    # TODO: check video completes/starts??
+    # TODO: check for duplicate rows/values
+        
+    df.rename(columns=video_columns, inplace=True)
+
+    
+
 def process_file(file):
     # TODO
-    tabs = pd.read_excel(file, sheet_name=['Video','Display'], skiprows=2).iloc[:, 1:]
+
+    errors = []
+    try:
+        video = pd.read_excel(file, sheet_name='Video', skiprows=2, usecols=list(range(1, 16)))
+        errors.extend(test_video(video))
+    except XLRDError as e: # TODO: get XLRDError
+        errors.append(e.__str__())
+    
     errors = None
     return errors
 
 def send_reply(service, thread_id, headers, filename, errors):
     
     if errors:
-        message_text = "something" # TODO
+        message_body = ("The file you sent was not accepted for the following reasons:\n"
+                        "\n".join([error for error in errors])
+        ) # TODO
     else:
-        message_text = "something else" # TODO
+        message_body = "The file you sent was accepted and processed into our system."
 
+    message_text = ("Thank you for sending a report to nbcu_analytics_data.\n"
+                    + message_body
+                    + "\n\nPlease do not reply to this message. If you have questions,"
+                    "please contact the NBCU planning team for this campaign.")
     message = MIMEText(message_text)
     message['to'] = headers['From']
     message['from'] = 'nbcu_analytics_data@essenceglobal.com'
