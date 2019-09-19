@@ -15,6 +15,7 @@ from google.cloud import storage
 from google.oauth2.credentials import Credentials
 from googleapiclient import discovery
 import pandas as pd
+from xlrd.biffh import XLRDError
 
 SCOPES = ['https://mail.google.com/'] # grants all permissions. proceed with caution.
 
@@ -73,12 +74,11 @@ def get_attachments(service, user_id, msg_id, message=None):
 def test_video(df: pd.DataFrame):
 
     errors = []
-    video_columns = {'Site': 'site', 'Data Source': 'dataSource', 'Date': 'date', 'Package Name': 'placementGroupName',
-                    'Placement Name or DCM ID': 'placementName', 'Creative': 'creativeName', 'Skip/Non-Skip': 'skip',
+    video_columns = {'Site': 'site', 'Data Source': 'dataSource', 'Date': 'date', 'DCM Package Name': 'placementGroupName',
+                    'DCM Placement Name or ID': 'placementName', 'Creative': 'creativeName', 'Skip/Non-Skip': 'skip',
                     'Video Type': 'videoType', 'Impressions (if applicable)': 'impressions', 'Video Starts': 'videoPlays',
                     '25% Completion': 'videoFirstQuartileCompletions', '50% Completion': 'videoMidpoints',
-                    '75% Completion': 'videoThirdQuartileCompletions', 'Video Completes': 'videoCompletions',
-                    'Completion Rate': 'videoCompletionRate'}
+                    '75% Completion': 'videoThirdQuartileCompletions', 'Video Completes': 'videoCompletions'}
     missing_cols = [lambda x: x for x in video_columns if x not in df.columns] # Columns that are missing from the file
     if len(missing_cols) > 0:
         errors.append("File is missing these columns: " + ", ".join(missing_cols))
@@ -95,10 +95,11 @@ def test_video(df: pd.DataFrame):
     except ValueError:
         errors.append("At least one invalid date in Date column.")
 
-    number_cols = list(filter(
-        lambda x: x not in missing_cols,
-        ['Impressions (if applicable)', 'Video Starts', '25% Completion',
-        '50% Completion', '75% Completion', 'Video Completes', 'Completion Rate']))
+    number_cols = [col for col in [
+        'Impressions (if applicable)', 'Video Starts', '25% Completion',
+        '50% Completion', '75% Completion', 'Video Completes']
+        if col not in missing_cols
+    ]
     error_num_cols = []
     for col in number_cols: # Check number columns
         try:
@@ -109,24 +110,55 @@ def test_video(df: pd.DataFrame):
         msg = "Non-numeric data in the following columns: " + ", ".join(error_num_cols)
         errors.append(msg)
 
-    # TODO: check video completes/starts??
-    # TODO: check for duplicate rows/values
+    if 'Video Completes' not in missing_cols: # Check video completes/starts
+        if not df.loc[~df['Video Starts'].isna() & df['Video Completes'].isna()].empty:
+            msg = "Some rows have Video Starts but no Video Completes."
+            errors.append(msg)
+        if not df.loc[df['Video Starts'] < df['Video Completes']].empty:
+            msg = "Some rows have more Video Completes than Video Starts."
+            errors.append(msg)
+
+    dimension_cols = [col for col in video_columns if (col not in num_cols) & (col not in missing_cols)]
+    check_dups = df.groupby(dimension_cols).count().max(axis=1)
+    if not check_dups.loc[check_dups > 1].empty:
+        msg = "Duplicate rows found."
+        errors.append(msg)
         
-    df.rename(columns=video_columns, inplace=True)
+    return errors
 
-    
-
-def process_file(file):
+def test_display(df: pd.DataFrame):
     # TODO
+    pass
+
+def test_file(file):
 
     errors = []
     try:
         video = pd.read_excel(file, sheet_name='Video', skiprows=2, usecols=list(range(1, 16)))
         errors.extend(test_video(video))
-    except XLRDError as e: # TODO: get XLRDError
+        display = pd.read_excel(file, sheet_name='Display', skiprows=2, usecols=list(range(1, 6))) # TODO: Find number of display columns
+        errors.extend(test_display(display))
+    except XLRDError as e:
+        errors.append(e.__str__())
+
+    if len(errors) > 0:
+        return errors
+    else:
+        return None    
+
+def process_file(file):
+    # TODO
+
+    errors = test_file(file)
+    if not errors:
+        # TODO: Write process
+    errors = []
+    try:
+        video = pd.read_excel(file, sheet_name='Video', skiprows=2, usecols=list(range(1, 16)))
+        errors.extend(test_video(video))
+    except XLRDError as e:
         errors.append(e.__str__())
     
-    errors = None
     return errors
 
 def send_reply(service, thread_id, headers, filename, errors):
