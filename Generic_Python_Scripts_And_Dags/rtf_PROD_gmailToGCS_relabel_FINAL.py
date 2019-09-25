@@ -9,6 +9,7 @@ from datetime import datetime
 from airflow import DAG, models
 from airflow.operators.dummy_operator import DummyOperator
 from airflow.operators.python_operator import PythonOperator
+from airflow.operators.subdag_operator import SubDagOperator
 from apiclient import errors
 from essence.analytics.platform import securedcredentials as secure_creds
 from google.cloud import storage
@@ -23,6 +24,14 @@ API_NAME = 'gmail'
 API_VERSION = 'v1'
 userId='nbcu_analytics_data@essenceglobal.com'
 
+gmail_service = authenticate()
+
+def authenticate():
+    data_value = secure_creds.getDataFromEssenceVault(userId)
+    credentials_dict = json.loads(data_value)
+    credentials = Credentials(**credentials_dict)
+    gmail_service = discovery.build(API_NAME, API_VERSION, credentials=credentials, cache_discovery=False)
+    return gmail_service    
 
 def query_for_message_ids(service, search_query):
 
@@ -136,77 +145,66 @@ def test_file(file):
     try:
         video = pd.read_excel(file, sheet_name='Video', skiprows=2, usecols=list(range(1, 16)))
         errors.extend(test_video(video))
-        display = pd.read_excel(file, sheet_name='Display', skiprows=2, usecols=list(range(1, 6))) # TODO: Find number of display columns
+        display = pd.read_excel(file, sheet_name='Display', skiprows=2, usecols=list(range(1, 6)))
         errors.extend(test_display(display))
     except XLRDError as e:
         errors.append(e.__str__())
 
-    if len(errors) > 0:
-        return errors
-    else:
-        return None    
-
-def process_file(file):
-    # TODO
-
-    errors = test_file(file)
-    if not errors:
-        # TODO: Write process
-    errors = []
-    try:
-        video = pd.read_excel(file, sheet_name='Video', skiprows=2, usecols=list(range(1, 16)))
-        errors.extend(test_video(video))
-    except XLRDError as e:
-        errors.append(e.__str__())
-    
     return errors
 
-def send_reply(service, thread_id, headers, filename, errors):
-    
-    if errors:
-        message_body = ("The file you sent was not accepted for the following reasons:\n"
-                        "\n".join([error for error in errors])
-        ) # TODO
-    else:
-        message_body = "The file you sent was accepted and processed into our system."
-
-    message_text = ("Thank you for sending a report to nbcu_analytics_data.\n"
-                    + message_body
-                    + "\n\nPlease do not reply to this message. If you have questions,"
-                    "please contact the NBCU planning team for this campaign.")
-    message = MIMEText(message_text)
-    message['to'] = headers['From']
-    message['from'] = 'nbcu_analytics_data@essenceglobal.com'
-    message['subject'] = headers['Subject']
+def create_reply(thread_id, headers, body_text=None):
+    message = MIMEText(body_text)
+    message['To'] = headers['From']
+    message['From'] = 'nbcu_analytics_data@essenceglobal.com' # TODO: Change
+    message['Subject'] = headers['Subject']
     body = {'raw': base64.urlsafe_b64encode(message.as_string())}
-    service.users().messages().send(userId='me', body=body).execute()
+    return body
 
-
-def processEmailScanning():
-
-    data_value = secure_creds.getDataFromEssenceVault(userId) # Gets creds from vault
-    credentials_dict = json.loads(data_value) # Loads creds as dict
-    credentials = Credentials(**credentials_dict) # Creates Google credentials from creds dict
-    gmail_service = discovery.build(API_NAME, API_VERSION, credentials=credentials, cache_discovery=False) # Build Gmail API service
+def get_messages():
     message_ids = query_for_message_ids(gmail_service, 'has:attachment')
+    return message_ids
 
-    for msg_id in message_ids:
-        message = gmail_service.users().messages().get(userId='me', id=msg_id).execute()
-        thread_id = message['threadId']
-        payload = message['payload']
-        headers = {header['name']: header['value'] for header in payload['headers']}
-        attachments = get_attachments(gmail_service, 'me', msg_id, message=message)
+def send_reply(message, file_results):
+    thread_id = message['threadId']
+    payload = message['payload']
+    headers = {header['name']: header['value'] for header in payload['headers']}
+    bodies = []
+    for filename, results in file_results.items():
+        if results == "Success": # TODO: Change
+            msg = filename + ": Successfully processed."
+        else:
+            msg = filename + ": \n" + "\n".join(results)
+        bodies.append(msg)
+    text = ("Thank you for sending data to nbcu_analytics_data.\n"
+            "Please review any errors below and send new files if necessary:\n"
+            + "\n".join(bodies)
+            + "\n\nThis inbox is not actively monitored. If you have questions, "
+            "please contact the NBCU planning team for this campaign."
+    )
+    body = create_reply(thread_id, headers, body_text=text)
+    gmail_service.users().messages().send(userId='me', body=body).execute()
+
+def process_emails(**context):
+    ti = context['ti']
+    msg_ids = ti.xcom_pull(task_ids='get_messages')
+    for id in msg_ids:
+        results = {}
+        to_bq = {}
+        message = gmail_service.user().messages().get(userId='me', id=id).execute()
+        attachments = get_attachments(gmail_service, 'me', id, message=message)
         for filename, file in attachments.items():
-            errors = process_file(file)
-            send_reply(gmail_service, thread_id, headers, filename, errors)      
-
-    # for i in range(len(messageID)):
-    #     get_attachments(gmail_service, 'me', messageID[i])
-    #     message = gmail_service.users().messages().modify(userId=userId, id=messageID[i], body={'removeLabelIds': [], 'addLabelIds': ['Label_7576572066746469364']}).execute()
+            file_results = test_file(file)
+            if len(file_results) == 0:
+                try:
+                    file_to_bq(file) # TODO
+                except Exception as e: # TODO
+                    file_results.append(e.__str__())
+            results[filename] = file_results
+            send_reply(message, results)
 
 dag = DAG(
-    'rtf_PROD_gmailToGCS_relabel_FINAL',
-    description='DAG to fetch gmail attachments and label as Processed',
+    'siteServed_to_BQ',
+    description='DAG to fetch gmail attachments and push to BQ',
     schedule_interval=None,
     start_date=datetime(2019, 8, 24),
     catchup=False
@@ -214,7 +212,11 @@ dag = DAG(
 
 dummy_operator = DummyOperator(task_id='dummy_task', retries=1, dag=dag)
 
-py_operator = PythonOperator(task_id='fetchDataFromGmail',
-    python_callable=processEmailScanning, dag=dag)
+getMessages = PythonOperator(task_id='getMessages', python_callable=get_messages, dag=dag)
+processEmails = PythonOperator(
+    task_id='processEmails',
+    python_callable=process_emails,
+    provide_context=True,
+    dag=dag)
 
 dummy_operator >> py_operator
