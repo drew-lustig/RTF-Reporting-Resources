@@ -24,14 +24,22 @@ API_NAME = 'gmail'
 API_VERSION = 'v1'
 userId='nbcu_analytics_data@essenceglobal.com'
 
-gmail_service = authenticate()
+credentials = get_google_creds()
+gmail_service = create_gmail_service()
 
-def authenticate():
+def get_google_creds():
     data_value = secure_creds.getDataFromEssenceVault(userId)
     credentials_dict = json.loads(data_value)
     credentials = Credentials(**credentials_dict)
+    return credentials
+
+def create_gmail_service():
     gmail_service = discovery.build(API_NAME, API_VERSION, credentials=credentials, cache_discovery=False)
-    return gmail_service    
+    return gmail_service 
+
+def create_bq_client():
+    bq_client = bq.Client(credentials=credentials, project='essence-analytics-nbcu-dwh')
+    return bq_client
 
 def query_for_message_ids(service, search_query):
 
@@ -184,12 +192,17 @@ def send_reply(message, file_results):
     body = create_reply(thread_id, headers, body_text=text)
     gmail_service.users().messages().send(userId='me', body=body).execute()
 
+def file_to_bq(file):
+
+    # Create BQ Client
+    # Upload to temp table
+    # Merge? Maybe do this after human check
+
 def process_emails(**context):
     ti = context['ti']
     msg_ids = ti.xcom_pull(task_ids='get_messages')
     for id in msg_ids:
         results = {}
-        to_bq = {}
         message = gmail_service.user().messages().get(userId='me', id=id).execute()
         attachments = get_attachments(gmail_service, 'me', id, message=message)
         for filename, file in attachments.items():
